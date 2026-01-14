@@ -50,3 +50,12 @@ qtcreator-*
 # Catkin custom files
 CATKIN_IGNORE
 git_stuff.txt
+
+results/matches*.*
+
+*.jpg
+*.png
+*.tif
+*.csv
+*.xml
+.DS_Store

@@ -3,6 +3,7 @@ import cv2
 import matplotlib.cm as cm
 import torch
 import numpy as np
+import checks
 
 
 from superglue_lib.models.matching import Matching
@@ -12,17 +13,14 @@ from superglue_lib.models.utils import (AverageTimer, VideoStreamer,
 torch.set_grad_enabled(False)
 
 
-def match_image(): 
+def match_image(input: str, output_dir: str): 
     """
     Wrapper function for matching two images, provides an interface to superglue model
     """
     center = None
-    input = '../assets/map/'
-    output_dir = "../results"
     image_glob = ['*.png', '*.jpg', '*.jpeg', '*.JPG']
     skip = 1
     max_length = 1000000
-
 
     # Important parameters to modify if you wish to improve the feature matching performance. 
     resize = [800] # Resize the image to this size before processing. Set to None to disable resizing.
@@ -33,7 +31,7 @@ def match_image():
     sinkhorn_iterations = 20 # Number of Sinkhorn iterations for matching.
     match_threshold = 0.5 # Remove matches with low confidence. Set to -1 to keep all matches.
     show_keypoints = True # Show the detected keypoints.
-    no_display = False
+    no_display = True
     force_cpu = False # Force CPU mode. It is significantly slower, but allows the model to run on systems withou dedicated GPU.
     
    
@@ -79,10 +77,6 @@ def match_image():
     last_frame = frame
     last_image_id = 0
 
-    if output_dir is not None:
-        print('==> Will write outputs to {}'.format(output_dir))
-        Path(output_dir).mkdir(exist_ok=True)
-
     # Create a window to display the demo.
     if not no_display:
         cv2.namedWindow('SuperGlue matches', cv2.WINDOW_NORMAL)
@@ -99,18 +93,20 @@ def match_image():
     located_image = None # the image of the satellite photo where the best match was found
     features_mean = [0,0] # mean values of feature pixel coordinates 
 
+    matches_to_return = []
+    confidence_to_return = []
+    matches_inv_to_return = []
+    confidence_inv_to_return = []
+
     while True:
         
         #current sattelite image to be matched
         frame, ret = vs.next_frame()
         if not ret:
-            print('Finished demo_superglue.py')
+            print('Finished checking all map images')
             break
         timer.update('data')
         stem0, stem1 = last_image_id, vs.i - 1
-
-
-        
 
         frame_tensor = frame2tensor(frame, device)
         pred = matching({**last_data, 'image1': frame_tensor})
@@ -118,14 +114,23 @@ def match_image():
         kpts1 = pred['keypoints1'][0].cpu().numpy()
         matches = pred['matches0'][0].cpu().numpy()
         confidence = pred['matching_scores0'][0].cpu().numpy()
-        timer.update('forward')
+        timer.update('forward')        
 
         valid = matches > -1
+        matches_valid = matches[valid]
         mkpts0 = kpts0[valid]
-        mkpts1 = kpts1[matches[valid]]
+        mkpts1 = kpts1[matches_valid]
+        confidence_valid = confidence[valid]
+
+        invalid = np.invert(valid)
+        matches_invalid = matches[invalid]
+        confidence_invalid = confidence[invalid]
+
+        #print(f"Matches: {matches_valid}")
+        #print(f"Confidence: {confidence_valid}")
 
         """
-        Find image in sattelite map with findHomography        
+        Find image in satellite map with findHomography        
         """
         #At least 4 matched features are needed to compute homography
         MATCHED = False
@@ -139,29 +144,48 @@ def match_image():
                 dst = cv2.perspectiveTransform(pts,M)
             except:
                 print("Perspective transform error. Abort matching.")
-                perspective_tranform_error = True    
+                perspective_tranform_error = True
 
             if (len(mkpts1) > max_matches) and not perspective_tranform_error: 
                 frame = cv2.polylines(frame,[np.int32(dst)],True,255,3, cv2.LINE_AA) 
                 moments = cv2.moments(dst)
-                cX = int(moments["m10"] / moments["m00"])
-                cY = int(moments["m01"] / moments["m00"])
-                center = (cX  ,cY) #shape[0] is Y coord, shape[1] is X coord
-                #use ratio here instead of pixels because image is reshaped in superglue
-                features_mean = np.mean(mkpts0, axis = 0)
 
-                #Draw the center of the area which has been matched
-                cv2.circle(frame, center, radius = 10, color = (255, 0, 255), thickness = 5)
-                cv2.circle(last_frame, (int(features_mean[0]), int(features_mean[1])), radius = 10, color = (255, 0, 0), thickness = 2)
-                center = (cX / frame.shape[1] ,cY /frame.shape[0] )
-                satellite_map_index = index
-                max_matches = len(mkpts1)
-                MATCHED = True
+                if moments["m00"] == 0:
+                    perspective_tranform_error = True
+                    print("Error calculating moments. Abort matching.")
+                else:
+                    cX = int(moments["m10"] / moments["m00"])
+                    cY = int(moments["m01"] / moments["m00"])
+                    center = (cX  ,cY) #shape[0] is Y coord, shape[1] is X coord
+
+                    # Check that the area has a logical shape.
+                    good_shape = checks.check_if_rectangular_like(dst, center)
+                    if not good_shape:
+                        print("Photos were matched, BUT match is not rectangularish")
+                    else:
+                        #use ratio here instead of pixels because image is reshaped in superglue
+                        features_mean = np.mean(mkpts0, axis = 0)
+
+                        #Draw the center of the area which has been matched
+                        cv2.circle(frame, center, radius = 10, color = (255, 0, 255), thickness = 5)
+                        cv2.circle(last_frame, (int(features_mean[0]), int(features_mean[1])), radius = 10, color = (255, 0, 0), thickness = 2)
+                        center = (cX / frame.shape[1] ,cY /frame.shape[0] )
+
+                        # Prepare data to be returned.
+                        satellite_map_index = index
+                        max_matches = len(mkpts1)
+                        matches_to_return = matches_valid.copy()
+                        confidence_to_return = confidence_valid.copy()
+                        matches_inv_to_return = matches_invalid.copy()
+                        confidence_inv_to_return = confidence_invalid.copy()
+
+                        MATCHED = True
+                        print("Photos were succesfully matched!")
 
         else:
             print("Photos were NOT matched")
       
-        color = cm.jet(confidence[valid])
+        color = cm.jet(confidence_valid)
         k_thresh = matching.superpoint.config['keypoint_threshold']
         m_thresh = matching.superglue.config['match_threshold']
         small_text = [
@@ -176,14 +200,13 @@ def match_image():
 
         if MATCHED == True:
             located_image = out
-        
 
         if not no_display:
             cv2.imshow('SuperGlue matches', out)
             key = chr(cv2.waitKey(1) & 0xFF)
             if key == 'q':
                 vs.cleanup()
-                print('Exiting (via q) demo_superglue.py')
+                print('Exiting (via q) UI')
                 break
             elif key == 'n':  # set the current frame as anchor
                 last_data = {k+'0': pred[k+'1'] for k in keys}
@@ -218,10 +241,9 @@ def match_image():
             print('\nWriting image to {}'.format(out_file))
             cv2.imwrite(out_file, out)
 
-
-    cv2.destroyAllWindows()
+    if not no_display:
+        cv2.destroyAllWindows()
+    
     vs.cleanup()
     
-    return satellite_map_index, center, located_image, features_mean, last_frame, max_matches
-    
-
+    return satellite_map_index, center, located_image, features_mean, last_frame, max_matches, matches_to_return, confidence_to_return, matches_inv_to_return, confidence_inv_to_return
